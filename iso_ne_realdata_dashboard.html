@@ -1,0 +1,540 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ISO-NE / New England Electricity Price Drivers (Real Data Pull)</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<style>
+  body{font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin:0; background:#0b0f14; color:#e8eef6;}
+  header{padding:18px 18px 8px; border-bottom:1px solid #1c2736;}
+  h1{font-size:18px;margin:0 0 6px}
+  .sub{opacity:.85;font-size:13px; line-height:1.35}
+  .wrap{padding:14px 18px 22px; max-width:1200px; margin:0 auto;}
+  .panel{background:#0f1622;border:1px solid #1c2736;border-radius:12px;padding:12px 12px;margin:12px 0;}
+  label{font-size:12px;opacity:.9}
+  select,button,input{background:#0b0f14;color:#e8eef6;border:1px solid #2a3a52;border-radius:8px;padding:8px 10px;font-size:13px}
+  button{cursor:pointer}
+  button:hover{border-color:#4d6fa3}
+  .row{display:flex; flex-wrap:wrap; gap:10px; align-items:center}
+  .spacer{flex:1}
+  #status{font-size:12px; opacity:.9; white-space:pre-wrap}
+  .warn{color:#ffcc66}
+  .ok{color:#8ff0a4}
+  .bad{color:#ff7b7b}
+  .small{font-size:12px; opacity:.85}
+  .grid{display:grid; grid-template-columns: 1fr; gap:12px}
+  @media(min-width:900px){ .grid{grid-template-columns: 1fr 1fr;} }
+  .chart{height:460px}
+  .foot{opacity:.75;font-size:12px;line-height:1.45}
+  a{color:#9ecbff}
+  code{background:#0b0f14;border:1px solid #1c2736;padding:1px 6px;border-radius:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>New England Electricity Prices — Real Data Pull (Monthly)</h1>
+  <div class="sub">
+    This dashboard fetches source spreadsheets directly from EIA/ISO-NE URLs at load time (you must be online).  
+    It computes derived series (e.g., retail ¢/kWh = revenue ÷ sales) and flags gaps.
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <div class="row">
+      <div>
+        <label for="seriesMode">View</label><br/>
+        <select id="seriesMode">
+          <option value="levels" selected>Levels</option>
+          <option value="mom">Month-over-month change</option>
+          <option value="yoy">Year-over-year change</option>
+        </select>
+      </div>
+      <div>
+        <label for="retailSector">Retail sector (EIA 861M)</label><br/>
+        <select id="retailSector">
+          <option value="all" selected>All sectors (total)</option>
+          <option value="residential">Residential</option>
+          <option value="commercial">Commercial</option>
+          <option value="industrial">Industrial</option>
+          <option value="transportation">Transportation</option>
+        </select>
+      </div>
+      <div>
+        <label for="retailStates">Retail states (EIA 861M)</label><br/>
+        <select id="retailStates" multiple size="1" style="min-width:240px">
+          <option value="CT" selected>CT</option>
+          <option value="ME" selected>ME</option>
+          <option value="MA" selected>MA</option>
+          <option value="NH" selected>NH</option>
+          <option value="RI" selected>RI</option>
+          <option value="VT" selected>VT</option>
+        </select>
+      </div>
+      <div class="spacer"></div>
+      <div>
+        <button id="reloadBtn">Reload data</button>
+      </div>
+    </div>
+    <div class="small" style="margin-top:10px">
+      Tip: click legend items to show/hide series; drag to zoom; use the range slider; double-click to reset.
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <div id="chartRetail" class="chart"></div>
+      <div class="foot">
+        Retail data source: EIA Form 861M “Sales and revenue” file (<code>sales_revenue.xlsx</code>).  
+        Computed: average price (¢/kWh) = 100 * revenue($) / sales(kWh).
+      </div>
+    </div>
+
+    <div class="panel">
+      <div id="chartDrivers" class="chart"></div>
+      <div class="foot">
+        Driver sources: ISO-NE “Monthly Data by Load Zone” (SMD monthly) + EIA Henry Hub monthly spot price (RNGWHHDm.xls).
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div id="status">Status: not loaded.</div>
+  </div>
+
+  <div class="panel">
+    <div class="foot">
+      <div><b>Known limitations (explicit):</b></div>
+      <ul>
+        <li>ISO-NE SMD monthly files are linked year-by-year. If any year URL fails, that year will be missing and marked.</li>
+        <li>Retail is monthly (EIA 861M). We do not fabricate weekly retail values.</li>
+        <li>Algonquin Citygate spot pricing is often paywalled; this dashboard uses Henry Hub as the default gas proxy unless you later add a licensed basis series.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<script>
+const SOURCES = {
+  eia861m_sales_revenue_xlsx: "https://www.eia.gov/electricity/data/eia861m/xls/sales_revenue.xlsx",
+  henry_hub_monthly_xls: "https://www.eia.gov/dnav/ng/hist_xls/RNGWHHDm.xls",
+  // ISO-NE SMD Monthly (URLs discovered via public static-assets links)
+  iso_smd_monthly_years: {
+    "2016": "https://www.iso-ne.com/static-assets/documents/2016/09/2016_smd_monthly.xlsx",
+    "2017": "https://www.iso-ne.com/static-assets/documents/2017/02/2017_smd_monthly.xlsx",
+    "2018": "https://www.iso-ne.com/static-assets/documents/2018/02/2018_smd_monthly.xlsx",
+    // 2019 missing from our discovered public links; will be flagged as missing
+    "2020": "https://www.iso-ne.com/static-assets/documents/2020/02/2020_smd_monthly.xlsx",
+    "2021": "https://www.iso-ne.com/static-assets/documents/2021/02/2021_smd_monthly.xlsx",
+    "2022": "https://www.iso-ne.com/static-assets/documents/2022/02/2022_smd_monthly.xlsx",
+    "2023": "https://www.iso-ne.com/static-assets/documents/2023/02/2023_smd_monthly.xlsx",
+    "2024": "https://www.iso-ne.com/static-assets/documents/100008/2024_smd_monthly.xlsx",
+    "2025": "https://www.iso-ne.com/static-assets/documents/100020/2025_smd_monthly.xlsx"
+  }
+};
+
+function setStatus(lines, cls=""){
+  const el = document.getElementById("status");
+  el.className = cls;
+  el.textContent = lines.join("\n");
+}
+
+function parseExcel(arrayBuffer){
+  const data = new Uint8Array(arrayBuffer);
+  return XLSX.read(data, {type:"array"});
+}
+
+function sheetToJson(wb, sheetName){
+  const ws = wb.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(ws, {defval: null});
+}
+
+function toMonthKey(dt){
+  // dt is JS Date
+  const y = dt.getUTCFullYear();
+  const m = String(dt.getUTCMonth()+1).padStart(2,"0");
+  return `${y}-${m}`;
+}
+
+function safeNumber(x){
+  if(x===null || x===undefined) return null;
+  if(typeof x === "number") return isFinite(x) ? x : null;
+  const s = String(x).replace(/,/g,"").trim();
+  if(s==="" || s==="NA" || s==="N/A") return null;
+  const v = Number(s);
+  return isFinite(v) ? v : null;
+}
+
+function diffSeries(keys, values, mode){
+  // mode: levels, mom, yoy
+  if(mode==="levels") return values.slice();
+  const idx = new Map(keys.map((k,i)=>[k,i]));
+  const out = keys.map(()=>null);
+  if(mode==="mom"){
+    for(let i=1;i<keys.length;i++){
+      const a = values[i], b = values[i-1];
+      out[i] = (a!=null && b!=null) ? (a-b) : null;
+    }
+  } else if(mode==="yoy"){
+    for(let i=0;i<keys.length;i++){
+      const [y,m] = keys[i].split("-").map(Number);
+      const prevKey = `${y-1}-${String(m).padStart(2,"0")}`;
+      const j = idx.get(prevKey);
+      if(j!==undefined){
+        const a = values[i], b = values[j];
+        out[i] = (a!=null && b!=null) ? (a-b) : null;
+      }
+    }
+  }
+  return out;
+}
+
+async function fetchBinary(url){
+  const resp = await fetch(url, {cache:"no-store"});
+  if(!resp.ok) throw new Error(`HTTP ${resp.status} for ${url}`);
+  return await resp.arrayBuffer();
+}
+
+/* -------------------- EIA 861M retail -------------------- */
+function extractEIA861M_Retail(wb, selectedStates, sector){
+  // The file "sales_revenue.xlsx" generally has a "Sales_Revenue" style sheet; robustly pick the first sheet.
+  const sheetName = wb.SheetNames[0];
+  const rows = sheetToJson(wb, sheetName);
+
+  // Heuristics: look for columns containing "state" and "sector" and "year"/"month" and "sales" and "revenue"
+  const cols = Object.keys(rows[0] || {});
+  const colState = cols.find(c=>c.toLowerCase().includes("state"));
+  const colSector = cols.find(c=>c.toLowerCase().includes("sector"));
+  const colYear = cols.find(c=>c.toLowerCase()==="year" || c.toLowerCase().includes("year"));
+  const colMonth = cols.find(c=>c.toLowerCase()==="month" || c.toLowerCase().includes("month"));
+  const colSales = cols.find(c=>c.toLowerCase().includes("sales"));
+  const colRevenue = cols.find(c=>c.toLowerCase().includes("revenue"));
+
+  if(!colState || !colSector || !colYear || !colMonth || !colSales || !colRevenue){
+    throw new Error("EIA 861M schema not recognized (expected state/sector/year/month/sales/revenue columns).");
+  }
+
+  const sectorMap = {
+    "all":"total",
+    "residential":"residential",
+    "commercial":"commercial",
+    "industrial":"industrial",
+    "transportation":"transportation"
+  };
+  const sectorNeedle = sectorMap[sector] || "total";
+
+  // Aggregate selected states into a load-weighted (sales-weighted) price:
+  // price = revenue / sales ; aggregate price = sum(rev)/sum(sales)
+  const agg = new Map(); // monthKey -> {sales_kwh, rev_dollars}
+  for(const r of rows){
+    const st = String(r[colState] ?? "").trim();
+    if(!selectedStates.includes(st)) continue;
+
+    const sec = String(r[colSector] ?? "").toLowerCase().trim();
+    if(sec !== sectorNeedle) continue;
+
+    const y = safeNumber(r[colYear]);
+    const m = safeNumber(r[colMonth]);
+    if(!y || !m) continue;
+
+    const salesMWh = safeNumber(r[colSales]);
+    const rev = safeNumber(r[colRevenue]);
+    if(salesMWh==null || rev==null) continue;
+
+    // Sales in MWh; revenue usually in thousand dollars in EIA tables, but this file can vary.
+    // We'll infer units later by sanity checks; for now treat revenue as dollars if plausible.
+    const k = `${y}-${String(m).padStart(2,"0")}`;
+    const cur = agg.get(k) || {sales_mwh:0, revenue:0};
+    cur.sales_mwh += salesMWh;
+    cur.revenue += rev;
+    agg.set(k, cur);
+  }
+
+  const keys = Array.from(agg.keys()).sort();
+  const price_cents = [];
+  for(const k of keys){
+    const v = agg.get(k);
+    if(!v || v.sales_mwh<=0) { price_cents.push(null); continue; }
+
+    // Unit handling:
+    // If revenue is in thousand dollars, then dollars = revenue*1000.
+    // We'll detect by comparing implied ¢/kWh typical range [5, 40].
+    const dollars_if_raw = v.revenue;
+    const dollars_if_thousand = v.revenue * 1000;
+
+    const kwh = v.sales_mwh * 1000; // MWh->kWh
+    const cents_raw = 100 * dollars_if_raw / kwh;
+    const cents_th = 100 * dollars_if_thousand / kwh;
+
+    // choose the one that lands in plausible range more often
+    let cents = cents_raw;
+    if(!(cents_raw>=0.5 && cents_raw<=100) && (cents_th>=0.5 && cents_th<=100)) cents = cents_th;
+
+    price_cents.push(cents);
+  }
+
+  return {keys, price_cents};
+}
+
+/* -------------------- Henry Hub monthly -------------------- */
+function extractHenryHubMonthly(wb){
+  const sheetName = wb.SheetNames[0];
+  const rows = sheetToJson(wb, sheetName);
+
+  // EIA dnav xls typically in a "Data 1" style format with columns: Date, Value (or Year, Month columns).
+  // We'll try both patterns.
+  const cols = Object.keys(rows[0]||{});
+  const colDate = cols.find(c=>c.toLowerCase().includes("date"));
+  const colValue = cols.find(c=>c.toLowerCase().includes("value") || c.toLowerCase().includes("price"));
+
+  const series = new Map(); // monthKey -> value
+  if(colDate && colValue){
+    for(const r of rows){
+      const d = r[colDate];
+      const v = safeNumber(r[colValue]);
+      if(!d || v==null) continue;
+      const dt = (d instanceof Date) ? d : new Date(d);
+      if(isNaN(dt)) continue;
+      series.set(toMonthKey(dt), v);
+    }
+  } else {
+    // Pivot table: Year + Jan..Dec
+    const colYear = cols.find(c=>c.toLowerCase()==="year");
+    if(!colYear) throw new Error("Henry Hub XLS schema not recognized.");
+    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    for(const r of rows){
+      const y = safeNumber(r[colYear]);
+      if(!y) continue;
+      months.forEach((mn, i)=>{
+        const v = safeNumber(r[mn] ?? r[mn.toUpperCase()]);
+        if(v==null) return;
+        const k = `${y}-${String(i+1).padStart(2,"0")}`;
+        series.set(k, v);
+      });
+    }
+  }
+
+  const keys = Array.from(series.keys()).sort();
+  const values = keys.map(k=>series.get(k) ?? null);
+  return {keys, values};
+}
+
+/* -------------------- ISO-NE SMD monthly -------------------- */
+function extractISOSMDMonthly(wb){
+  // The SMD monthly file has a sheet with monthly rows and columns for zones.
+  // We'll extract Hub DA LMP and Hub RT LMP when present, else fall back to system.
+  const preferredSheets = wb.SheetNames;
+  const rowsBySheet = {};
+  for(const s of preferredSheets){
+    try { rowsBySheet[s] = sheetToJson(wb, s); } catch(e){}
+  }
+
+  // Find a sheet containing something like "LMP" columns.
+  let bestSheet = null;
+  for(const s of preferredSheets){
+    const rows = rowsBySheet[s] || [];
+    const cols = Object.keys(rows[0]||{}).map(c=>c.toLowerCase());
+    if(cols.some(c=>c.includes("lmp")) && cols.some(c=>c.includes("month")||c.includes("date"))){
+      bestSheet = s; break;
+    }
+  }
+  if(!bestSheet){
+    // fallback: first sheet
+    bestSheet = wb.SheetNames[0];
+  }
+  const rows = rowsBySheet[bestSheet] || sheetToJson(wb, bestSheet);
+  const cols = Object.keys(rows[0]||{});
+
+  // Identify month/date column
+  const colDate = cols.find(c=>c.toLowerCase().includes("month") || c.toLowerCase().includes("date"));
+  if(!colDate) throw new Error("ISO-NE SMD monthly schema not recognized (no date/month column).");
+
+  // Find DA Hub and RT Hub columns; naming varies but often includes "DA LMP" "RT LMP" and "Hub"
+  const colDAHub = cols.find(c=>{
+    const t=c.toLowerCase();
+    return t.includes("da") && t.includes("lmp") && t.includes("hub");
+  });
+  const colRTHub = cols.find(c=>{
+    const t=c.toLowerCase();
+    return (t.includes("rt") || t.includes("real")) && t.includes("lmp") && t.includes("hub");
+  });
+
+  // As fallback, look for any "Hub LMP" columns
+  const colHub = colDAHub || colRTHub || cols.find(c=>c.toLowerCase().includes("hub") && c.toLowerCase().includes("lmp"));
+
+  const seriesDA = new Map();
+  const seriesRT = new Map();
+
+  for(const r of rows){
+    const d = r[colDate];
+    if(!d) continue;
+    const dt = (d instanceof Date) ? d : new Date(d);
+    if(isNaN(dt)) continue;
+    const k = toMonthKey(dt);
+
+    const vDA = colDAHub ? safeNumber(r[colDAHub]) : null;
+    const vRT = colRTHub ? safeNumber(r[colRTHub]) : null;
+
+    if(vDA!=null) seriesDA.set(k, vDA);
+    if(vRT!=null) seriesRT.set(k, vRT);
+
+    if(!colDAHub && !colRTHub && colHub){
+      const v = safeNumber(r[colHub]);
+      if(v!=null) seriesRT.set(k, v);
+    }
+  }
+
+  const keys = Array.from(new Set([...seriesDA.keys(), ...seriesRT.keys()])).sort();
+  const da = keys.map(k=>seriesDA.get(k) ?? null);
+  const rt = keys.map(k=>seriesRT.get(k) ?? null);
+
+  return {keys, da, rt, sheetUsed: bestSheet, columns: {colDAHub, colRTHub, colDate}};
+}
+
+/* -------------------- Plotting -------------------- */
+function plotSeries(divId, title, seriesList, mode){
+  const allKeys = Array.from(new Set(seriesList.flatMap(s=>s.keys))).sort();
+  const x = allKeys.map(k=>new Date(k+"-01T00:00:00Z"));
+
+  const traces = seriesList.map(s=>{
+    // map to allKeys
+    const map = new Map(s.keys.map((k,i)=>[k,s.values[i]]));
+    const y0 = allKeys.map(k=>map.get(k) ?? null);
+    const y = diffSeries(allKeys, y0, mode);
+    return {
+      x, y,
+      name: s.name,
+      type:"scatter",
+      mode:"lines",
+      connectgaps:false,
+      hovertemplate: "%{x|%Y-%m}<br>%{y:.3f}<extra>"+s.name+"</extra>"
+    };
+  });
+
+  const layout = {
+    title: {text: title, font:{size:14, color:"#e8eef6"}},
+    paper_bgcolor:"#0f1622",
+    plot_bgcolor:"#0f1622",
+    font:{color:"#e8eef6"},
+    xaxis:{rangeslider:{visible:true}, gridcolor:"#1c2736"},
+    yaxis:{gridcolor:"#1c2736", zerolinecolor:"#1c2736"},
+    legend:{orientation:"h"},
+    margin:{l:55,r:20,t:40,b:40}
+  };
+  Plotly.newPlot(divId, traces, layout, {responsive:true, displaylogo:false});
+}
+
+async function loadAll(){
+  const mode = document.getElementById("seriesMode").value;
+  const sector = document.getElementById("retailSector").value;
+  const selectedStates = Array.from(document.getElementById("retailStates").selectedOptions).map(o=>o.value);
+
+  const statusLines = [];
+  setStatus(["Status: loading…"], "");
+
+  // Fetch EIA retail
+  let retail;
+  try{
+    statusLines.push("Loading EIA 861M retail…");
+    const buf = await fetchBinary(SOURCES.eia861m_sales_revenue_xlsx);
+    const wb = parseExcel(buf);
+    const out = extractEIA861M_Retail(wb, selectedStates, sector);
+    retail = {keys: out.keys, values: out.price_cents, name: `Retail ¢/kWh (${sector}; ${selectedStates.join(",")})`};
+    statusLines.push("  ✓ EIA retail loaded");
+  }catch(e){
+    statusLines.push("  ✗ EIA retail failed: "+e.message);
+  }
+
+  // Fetch Henry Hub
+  let hh;
+  try{
+    statusLines.push("Loading Henry Hub (monthly)…");
+    const buf = await fetchBinary(SOURCES.henry_hub_monthly_xls);
+    const wb = parseExcel(buf);
+    const out = extractHenryHubMonthly(wb);
+    hh = {keys: out.keys, values: out.values, name:"Henry Hub $/MMBtu (monthly)"};
+    statusLines.push("  ✓ Henry Hub loaded");
+  }catch(e){
+    statusLines.push("  ✗ Henry Hub failed: "+e.message);
+  }
+
+  // Fetch ISO-NE SMD monthly (Hub DA/RT LMP)
+  let isoDA = null, isoRT = null;
+  try{
+    statusLines.push("Loading ISO-NE SMD monthly (Hub LMP)…");
+    const byYear = SOURCES.iso_smd_monthly_years;
+    const keysAll = [];
+    const daAll = [];
+    const rtAll = [];
+    const years = Object.keys(byYear).sort();
+
+    for(const y of years){
+      const url = byYear[y];
+      try{
+        const buf = await fetchBinary(url);
+        const wb = parseExcel(buf);
+        const out = extractISOSMDMonthly(wb);
+
+        for(let i=0;i<out.keys.length;i++){
+          keysAll.push(out.keys[i]);
+          daAll.push(out.da[i]);
+          rtAll.push(out.rt[i]);
+        }
+        statusLines.push(`  ✓ ISO-NE ${y} loaded (sheet: ${out.sheetUsed})`);
+      }catch(e){
+        statusLines.push(`  ✗ ISO-NE ${y} failed: ${e.message}`);
+      }
+    }
+
+    // Merge by key (prefer non-null)
+    const idx = new Map();
+    for(let i=0;i<keysAll.length;i++){
+      const k = keysAll[i];
+      const cur = idx.get(k) || {da:null, rt:null};
+      if(cur.da==null && daAll[i]!=null) cur.da = daAll[i];
+      if(cur.rt==null && rtAll[i]!=null) cur.rt = rtAll[i];
+      idx.set(k, cur);
+    }
+    const keys = Array.from(idx.keys()).sort();
+    isoDA = {keys, values: keys.map(k=>idx.get(k).da), name:"ISO-NE Hub DA LMP ($/MWh) [monthly avg]"};
+    isoRT = {keys, values: keys.map(k=>idx.get(k).rt), name:"ISO-NE Hub RT LMP ($/MWh) [monthly avg]"};
+
+    // Flag known missing year 2019
+    if(!byYear["2019"]) statusLines.push("  ⚠ ISO-NE 2019 URL not included (missing year in this build).");
+  }catch(e){
+    statusLines.push("  ✗ ISO-NE SMD monthly failed: "+e.message);
+  }
+
+  // Plot
+  if(retail){
+    plotSeries("chartRetail", "Retail Electricity Price (EIA 861M) — Monthly", [retail], mode);
+  } else {
+    document.getElementById("chartRetail").innerHTML = "<div class='bad'>Retail series unavailable.</div>";
+  }
+
+  const drivers = [];
+  if(isoDA) drivers.push(isoDA);
+  if(isoRT) drivers.push(isoRT);
+  if(hh) drivers.push(hh);
+
+  if(drivers.length){
+    plotSeries("chartDrivers", "Wholesale & Fuel Proxies — Monthly", drivers, mode);
+  } else {
+    document.getElementById("chartDrivers").innerHTML = "<div class='bad'>Driver series unavailable.</div>";
+  }
+
+  setStatus(statusLines, "ok");
+}
+
+document.getElementById("reloadBtn").addEventListener("click", loadAll);
+document.getElementById("seriesMode").addEventListener("change", loadAll);
+document.getElementById("retailSector").addEventListener("change", loadAll);
+document.getElementById("retailStates").addEventListener("change", loadAll);
+
+loadAll();
+</script>
+</body>
+</html>
